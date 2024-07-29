@@ -37,25 +37,181 @@ class NWCWallet(Wallet):
         # Parse pairing url (if invalid an exception is raised)
         nwc_data = _parse_nwc(settings.nwc_pairing_url)
 
-        # Extract keys (used to sign nwc events+identify NWC user)
-        self.account_private_key = secp256k1.PrivateKey(
-            bytes.fromhex(nwc_data["secret"])
+        self.conn = NWConnection(
+            secret=nwc_data["secret"],
+            pubkey=nwc_data["pubkey"],
+            relay=nwc_data["relay"],
         )
-        self.account_private_key_hex = nwc_data["secret"]
+
+    def _is_shutting_down(self) -> bool:
+        """
+        Returns True if the wallet is shutting down.
+        """
+        return self.conn.shutdown or not settings.lnbits_running
+
+    async def cleanup(self):
+        logger.debug("Closing NWCWallet connection")
+        await self.conn.close()
+
+    async def create_invoice(
+        self,
+        amount: int,
+        memo: Optional[str] = None,
+        description_hash: Optional[bytes] = None,
+        unhashed_description: Optional[bytes] = None,
+        **kwargs
+    ) -> InvoiceResponse:
+        desc = ""
+        desc_hash = None
+        if description_hash:
+            desc_hash = description_hash.hex()
+            desc = (unhashed_description or b"").decode()
+        elif unhashed_description:
+            desc = unhashed_description.decode()
+            desc_hash = hashlib.sha256(desc.encode()).hexdigest()
+        else:
+            desc = memo or ""
+        try:
+            info = await self.conn._get_info()
+            if "make_invoice" not in info["supported_methods"]:
+                return InvoiceResponse(
+                    False,
+                    None,
+                    None,
+                    "make_invoice is not supported by this NWC service.",
+                )
+            resp = await self.conn._call(
+                "make_invoice",
+                {
+                    "amount": int(amount * 1000),  # nwc uses msats denominations
+                    "description_hash": desc_hash,
+                    "description": desc,
+                },
+            )
+            checking_id = str(resp["payment_hash"])
+            payment_request = resp.get("invoice", None)
+            # if lookup_invoice is not supported, we can't track the payment
+            if "lookup_invoice" in info["supported_methods"]:
+                created_at = int(resp.get("created_at", time.time()))
+                expires_at = int(resp.get("expires_at", created_at + 3600))
+                self.conn.pending_payments.append(
+                    {  # Start tracking
+                        "checking_id": checking_id,
+                        "expires_at": expires_at,
+                        "settled": False,
+                    }
+                )
+            return InvoiceResponse(True, checking_id, payment_request, None)
+        except Exception as e:
+            return InvoiceResponse(ok=False, error_message=str(e))
+
+    async def status(self) -> StatusResponse:
+        try:
+            info = await self.conn._get_info()
+            if "get_balance" not in info["supported_methods"]:
+                logger.debug("get_balance is not supported by this NWC service.")
+                return StatusResponse(None, 0)
+            resp = await self.conn._call("get_balance", {})
+            balance = int(resp["balance"])
+            return StatusResponse(None, balance)
+        except Exception as e:
+            return StatusResponse(str(e), 0)
+
+    async def pay_invoice(self, bolt11: str, fee_limit_msat: int) -> PaymentResponse:
+        try:
+            resp = await self.conn._call("pay_invoice", {"invoice": bolt11})
+            preimage = resp.get("preimage", None)
+            invoice_data = bolt11_decode(bolt11)
+            payment_hash = invoice_data.payment_hash
+            # pay_invoice doesn't return payment data, so we need
+            # to call lookup_invoice too (if supported)
+            info = await self.conn._get_info()
+            if "lookup_invoice" in info["supported_methods"]:
+                try:
+                    payment_data = await self.conn._call(
+                        "lookup_invoice", {"invoice": bolt11}
+                    )
+                    settled = payment_data.get("settled_at", None) and payment_data.get(
+                        "preimage", None
+                    )
+                    if not settled:
+                        return PaymentResponse(None, payment_hash, None, None, None)
+                    else:
+                        fee_msat = payment_data.get("fees_paid", None)
+                        return PaymentResponse(
+                            True, payment_hash, fee_msat, preimage, None
+                        )
+                except Exception:
+                    # Workaround: some nwc service providers might not store the invoice
+                    # right away, so this call may raise an exception.
+                    # We will assume the payment is pending anyway
+                    return PaymentResponse(None, payment_hash, None, None, None)
+            else:  # if not supported, we assume it succeeded
+                return PaymentResponse(True, payment_hash, None, preimage, None)
+
+        except Exception as e:
+            return PaymentResponse(ok=False, error_message=str(e))
+
+    async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
+        return await self.get_payment_status(checking_id)
+
+    async def get_payment_status(self, checking_id: str) -> PaymentStatus:
+        try:
+            info = await self.conn._get_info()
+            if "lookup_invoice" in info["supported_methods"]:
+                payment_data = await self.conn._call(
+                    "lookup_invoice", {"payment_hash": checking_id}
+                )
+                settled = payment_data.get("settled_at", None) and payment_data.get(
+                    "preimage", None
+                )
+                fee_msat = payment_data.get("fees_paid", None)
+                preimage = payment_data.get("preimage", None)
+                created_at = int(payment_data.get("created_at", time.time()))
+                expires_at = int(payment_data.get("expires_at", created_at + 3600))
+                expired = expires_at and time.time() > expires_at
+                if expired and not settled:
+                    return PaymentStatus(False, fee_msat=fee_msat, preimage=preimage)
+                else:
+                    return PaymentStatus(
+                        True if settled else None, fee_msat=fee_msat, preimage=preimage
+                    )
+            else:
+                return PaymentStatus(None, fee_msat=None, preimage=None)
+        except Exception as e:
+            logger.error("Error getting payment status: " + str(e))
+            return PaymentFailedStatus()
+
+    async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
+        while not self._is_shutting_down():
+            value = await self.conn.paid_invoices_queue.get()
+            yield value
+
+
+class NWConnection:
+
+    def __init__(
+        self,
+        secret: str,
+        pubkey: str,
+        relay: str,
+    ) -> None:
+
+        # Extract keys (used to sign nwc events+identify NWC user)
+        self.account_private_key = secp256k1.PrivateKey(bytes.fromhex(secret))
+        self.account_private_key_hex = secret
         self.account_public_key = self.account_private_key.pubkey
         self.account_public_key_hex = self.account_public_key.serialize().hex()[2:]
 
         # Extract service key (used for encryption to identify the nwc service provider)
-        self.service_pubkey = secp256k1.PublicKey(
-            bytes.fromhex("02" + nwc_data["pubkey"]), True
-        )
-        self.service_pubkey_hex = nwc_data["pubkey"]
+        self.service_pubkey = secp256k1.PublicKey(bytes.fromhex("02" + pubkey), True)
+        self.service_pubkey_hex = pubkey
 
         # Extract relay url
-        self.relay = nwc_data["relay"]
+        self.relay = relay
 
         # Create temporary subscriptions, stored until the response is received/expires
-        self.subscriptions = {}
+        self.subscriptions: Dict = {}
         # Timeout in seconds after which a subscription is closed
         # if no response is received
         self.subscription_timeout = 10
@@ -64,7 +220,7 @@ class NWCWallet(Wallet):
 
         # pending payments for paid_invoices_stream.
         # They are tracked until they expire or are settled
-        self.pending_payments = []
+        self.pending_payments: List[Dict] = []
         # interval in seconds between checks for pending payments
         self.pending_payments_lookup_interval = 10
         # track paid invoices for paid_invoices_stream
@@ -78,7 +234,7 @@ class NWCWallet(Wallet):
         self.shutdown = False
 
         # cached info about the service provider
-        self.info = None
+        self.info: Optional[Dict] = None
 
         # This task handles connection and reconnection to the relay
         self.connection_task = asyncio.create_task(self._connect_to_relay())
@@ -92,8 +248,9 @@ class NWCWallet(Wallet):
             self._handle_pending_payments()
         )
 
+        self.account_public_key = self.account_private_key.pubkey
         logger.info(
-            "NWCWallet is ready. relay: "
+            "NWConnection is ready. relay: "
             + self.relay
             + " account: "
             + self.account_public_key_hex
@@ -101,11 +258,68 @@ class NWCWallet(Wallet):
             + self.service_pubkey_hex
         )
 
-    def _is_shutting_down(self) -> bool:
+    async def _call(self, method: str, params: Dict) -> Dict:
         """
-        Returns True if the wallet is shutting down.
+        Call a NWC method.
+
+        Args:
+            method (str): The method name.
+            params (Dict): The method parameters.
+
+        Returns:
+            Dict: The result of the method call.
         """
-        return self.shutdown or not settings.lnbits_running
+        await self._wait_for_connection()
+        logger.debug("Calling " + method + " with params: " + str(params))
+        # Prepare the content
+        content = _json_dumps(
+            {
+                "method": method,
+                "params": params,
+            }
+        )
+        # Encrypt
+        shared_secret = self.service_pubkey.tweak_mul(
+            bytes.fromhex(self.account_private_key_hex)
+        ).serialize()[1:]
+        content = _encrypt_content(content, shared_secret)
+        # Prepare the NWC event
+        event = {
+            "kind": 23194,
+            "content": content,
+            "created_at": int(time.time()),
+            "tags": [["p", self.service_pubkey_hex]],
+        }
+        # Sign
+        _sign_event(event, self.account_private_key)
+        # Subscribe for a response to this event
+        sub_filter = {
+            "kinds": [23195],
+            "#p": [self.account_public_key_hex],
+            "#e": [event["id"]],
+            "since": int(time.time()),
+        }
+        sub_id = self._get_new_subid()
+        # register a future to receive the response asynchronously
+        future = asyncio.get_event_loop().create_future()
+        # Check if the subscription already exists
+        # (this means there is a bug somewhere, should not happen)
+        if event["id"] in self.subscriptions:
+            raise Exception("Subscription for this event id already exists?")
+        # Store the subscription in the list
+        self.subscriptions[event["id"]] = {
+            "method": method,
+            "future": future,
+            "sub_id": sub_id,
+            "event_id": event["id"],
+            "timestamp": time.time(),
+            "closed": False,
+        }
+        # Send the events
+        await self._send(["REQ", sub_id, sub_filter])
+        await self._send(["EVENT", event])
+        # Wait for the response
+        return await future
 
     async def _send(self, data: List[Union[str, Dict]]):
         """
@@ -438,69 +652,6 @@ class NWCWallet(Wallet):
                 logger.debug("Reconnecting to NWC relay in 5 seconds...")
                 await asyncio.sleep(5)
 
-    async def _call(self, method: str, params: Dict) -> Dict:
-        """
-        Call a NWC method.
-
-        Args:
-            method (str): The method name.
-            params (Dict): The method parameters.
-
-        Returns:
-            Dict: The result of the method call.
-        """
-        await self._wait_for_connection()
-        logger.debug("Calling " + method + " with params: " + str(params))
-        # Prepare the content
-        content = _json_dumps(
-            {
-                "method": method,
-                "params": params,
-            }
-        )
-        # Encrypt
-        shared_secret = self.service_pubkey.tweak_mul(
-            bytes.fromhex(self.account_private_key_hex)
-        ).serialize()[1:]
-        content = _encrypt_content(content, shared_secret)
-        # Prepare the NWC event
-        event = {
-            "kind": 23194,
-            "content": content,
-            "created_at": int(time.time()),
-            "tags": [["p", self.service_pubkey_hex]],
-        }
-        # Sign
-        _sign_event(event, self.account_private_key)
-        # Subscribe for a response to this event
-        sub_filter = {
-            "kinds": [23195],
-            "#p": [self.account_public_key_hex],
-            "#e": [event["id"]],
-            "since": int(time.time()),
-        }
-        sub_id = self._get_new_subid()
-        # register a future to receive the response asynchronously
-        future = asyncio.get_event_loop().create_future()
-        # Check if the subscription already exists
-        # (this means there is a bug somewhere, should not happen)
-        if event["id"] in self.subscriptions:
-            raise Exception("Subscription for this event id already exists?")
-        # Store the subscription in the list
-        self.subscriptions[event["id"]] = {
-            "method": method,
-            "future": future,
-            "sub_id": sub_id,
-            "event_id": event["id"],
-            "timestamp": time.time(),
-            "closed": False,
-        }
-        # Send the events
-        await self._send(["REQ", sub_id, sub_filter])
-        await self._send(["EVENT", event])
-        # Wait for the response
-        return await future
-
     async def _get_info(self) -> Dict:
         """
         Get the info about the service provider and cache it.
@@ -533,7 +684,7 @@ class NWCWallet(Wallet):
                     try:
                         account_info = await self._call("get_info", {})
                         # cache
-                        self.info = service_info
+                        self.info = service_info or {}
                         self.info["alias"] = account_info.get("alias", "")
                         self.info["color"] = account_info.get("color", "")
                         self.info["pubkey"] = account_info.get("pubkey", "")
@@ -564,10 +715,11 @@ class NWCWallet(Wallet):
                 self.info = {
                     "supported_methods": ["pay_invoice"],
                 }
-        return self.info
+        # TODO: fix `or {}`
+        return self.info or {}
 
-    async def cleanup(self):
-        logger.debug("Closing NWCWallet connection")
+    async def close(self):
+        logger.debug("Closing NWConnection")
         self.shutdown = True  # Mark for shutdown
         # cancel all tasks
         try:
@@ -589,139 +741,11 @@ class NWCWallet(Wallet):
         except Exception as e:
             logger.warning("Error closing wallet connection: " + str(e))
 
-    async def create_invoice(
-        self,
-        amount: int,
-        memo: Optional[str] = None,
-        description_hash: Optional[bytes] = None,
-        unhashed_description: Optional[bytes] = None,
-        **kwargs
-    ) -> InvoiceResponse:
-        desc = ""
-        desc_hash = None
-        if description_hash:
-            desc_hash = description_hash.hex()
-            desc = (unhashed_description or b"").decode()
-        elif unhashed_description:
-            desc = unhashed_description.decode()
-            desc_hash = hashlib.sha256(desc.encode()).hexdigest()
-        else:
-            desc = memo or ""
-        try:
-            info = await self._get_info()
-            if "make_invoice" not in info["supported_methods"]:
-                return InvoiceResponse(
-                    False,
-                    None,
-                    None,
-                    "make_invoice is not supported by this NWC service.",
-                )
-            resp = await self._call(
-                "make_invoice",
-                {
-                    "amount": int(amount * 1000),  # nwc uses msats denominations
-                    "description_hash": desc_hash,
-                    "description": desc,
-                },
-            )
-            checking_id = str(resp["payment_hash"])
-            payment_request = resp.get("invoice", None)
-            # if lookup_invoice is not supported, we can't track the payment
-            if "lookup_invoice" in info["supported_methods"]:
-                created_at = int(resp.get("created_at", time.time()))
-                expires_at = int(resp.get("expires_at", created_at + 3600))
-                self.pending_payments.append(
-                    {  # Start tracking
-                        "checking_id": checking_id,
-                        "expires_at": expires_at,
-                        "settled": False,
-                    }
-                )
-            return InvoiceResponse(True, checking_id, payment_request, None)
-        except Exception as e:
-            return InvoiceResponse(ok=False, error_message=str(e))
-
-    async def status(self) -> StatusResponse:
-        try:
-            info = await self._get_info()
-            if "get_balance" not in info["supported_methods"]:
-                logger.debug("get_balance is not supported by this NWC service.")
-                return StatusResponse(None, 0)
-            resp = await self._call("get_balance", {})
-            balance = int(resp["balance"])
-            return StatusResponse(None, balance)
-        except Exception as e:
-            return StatusResponse(str(e), 0)
-
-    async def pay_invoice(self, bolt11: str, fee_limit_msat: int) -> PaymentResponse:
-        try:
-            resp = await self._call("pay_invoice", {"invoice": bolt11})
-            preimage = resp.get("preimage", None)
-            invoice_data = bolt11_decode(bolt11)
-            payment_hash = invoice_data.payment_hash
-            # pay_invoice doesn't return payment data, so we need
-            # to call lookup_invoice too (if supported)
-            info = await self._get_info()
-            if "lookup_invoice" in info["supported_methods"]:
-                try:
-                    payment_data = await self._call(
-                        "lookup_invoice", {"invoice": bolt11}
-                    )
-                    settled = payment_data.get("settled_at", None) and payment_data.get(
-                        "preimage", None
-                    )
-                    if not settled:
-                        return PaymentResponse(None, payment_hash, None, None, None)
-                    else:
-                        fee_msat = payment_data.get("fees_paid", None)
-                        return PaymentResponse(
-                            True, payment_hash, fee_msat, preimage, None
-                        )
-                except Exception:
-                    # Workaround: some nwc service providers might not store the invoice
-                    # right away, so this call may raise an exception.
-                    # We will assume the payment is pending anyway
-                    return PaymentResponse(None, payment_hash, None, None, None)
-            else:  # if not supported, we assume it succeeded
-                return PaymentResponse(True, payment_hash, None, preimage, None)
-
-        except Exception as e:
-            return PaymentResponse(ok=False, error_message=str(e))
-
-    async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
-        return await self.get_payment_status(checking_id)
-
-    async def get_payment_status(self, checking_id: str) -> PaymentStatus:
-        try:
-            info = await self._get_info()
-            if "lookup_invoice" in info["supported_methods"]:
-                payment_data = await self._call(
-                    "lookup_invoice", {"payment_hash": checking_id}
-                )
-                settled = payment_data.get("settled_at", None) and payment_data.get(
-                    "preimage", None
-                )
-                fee_msat = payment_data.get("fees_paid", None)
-                preimage = payment_data.get("preimage", None)
-                created_at = int(payment_data.get("created_at", time.time()))
-                expires_at = int(payment_data.get("expires_at", created_at + 3600))
-                expired = expires_at and time.time() > expires_at
-                if expired and not settled:
-                    return PaymentStatus(False, fee_msat=fee_msat, preimage=preimage)
-                else:
-                    return PaymentStatus(
-                        True if settled else None, fee_msat=fee_msat, preimage=preimage
-                    )
-            else:
-                return PaymentStatus(None, fee_msat=None, preimage=None)
-        except Exception as e:
-            logger.error("Error getting payment status: " + str(e))
-            return PaymentFailedStatus()
-
-    async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
-        while not self._is_shutting_down():
-            value = await self.paid_invoices_queue.get()
-            yield value
+    def _is_shutting_down(self) -> bool:
+        """
+        Returns True if the connection is shutting down.
+        """
+        return self.shutdown or not settings.lnbits_running
 
 
 def _parse_nwc(nwc) -> Dict:
