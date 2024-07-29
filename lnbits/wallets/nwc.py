@@ -33,40 +33,9 @@ class NWCWallet(Wallet):
     https://nwc.dev/
     """
 
-    def _parse_nwc(self, nwc) -> Dict:
-        """
-        Parses a NWC URL (nostr+walletconnect://...) and extracts relevant information.
-
-        Args:
-            nwc (str): The Nostr Wallet Connect URL to be parsed.
-
-        Returns:
-            Dict[str, str]: A dict containing:'pubkey', 'relay', and 'secret'.
-            If the URL is invalid, an exception is raised.
-
-        Example:
-            >>> _parse_nwc("nostr+walletconnect://000000...000000?relay=example.com&secret=123")
-            {'pubkey': '000000...000000', 'relay': 'example.com', 'secret': '123'}
-        """
-        data = {}
-        prefix = "nostr+walletconnect://"
-        if nwc and nwc.startswith(prefix):
-            nwc = nwc[len(prefix) :]
-            parsed_url = urlparse(nwc)
-            data["pubkey"] = parsed_url.path
-            query_params = parse_qs(parsed_url.query)
-            for key, value in query_params.items():
-                if key in ["relay", "secret"] and value:
-                    data[key] = unquote(value[0])
-            if "pubkey" not in data or "relay" not in data or "secret" not in data:
-                raise ValueError("Invalid NWC pairing url")
-        else:
-            raise ValueError("Invalid NWC pairing url")
-        return data
-
     def __init__(self):
         # Parse pairing url (if invalid an exception is raised)
-        nwc_data = self._parse_nwc(settings.nwc_pairing_url)
+        nwc_data = _parse_nwc(settings.nwc_pairing_url)
 
         # Extract keys (used to sign nwc events+identify NWC user)
         self.account_private_key = secp256k1.PrivateKey(
@@ -132,20 +101,6 @@ class NWCWallet(Wallet):
             + self.service_pubkey_hex
         )
 
-    def _json_dumps(self, data: Union[Dict, list]) -> str:
-        """
-        Converts a Python dictionary to a JSON string with compact encoding.
-
-        Args:
-            data (Dict): The dictionary to be converted.
-
-        Returns:
-            str: The compact JSON string.
-        """
-        if isinstance(data, Dict):
-            data = {k: v for k, v in data.items() if v is not None}
-        return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-
     def _is_shutting_down(self) -> bool:
         """
         Returns True if the wallet is shutting down.
@@ -167,7 +122,7 @@ class NWCWallet(Wallet):
             logger.warning("Trying to send data without a connection")
             return
         await self._wait_for_connection()  # ensure the connection is established
-        tx = self._json_dumps(data)
+        tx = _json_dumps(data)
         await self.ws.send(tx)
 
     def _get_new_subid(self) -> str:
@@ -352,9 +307,7 @@ class NWCWallet(Wallet):
         """
         sub_id = cast(str, msg[1])
         event = cast(Dict, msg[2])
-        if not self._verify_event(
-            event
-        ):  # Ensure the event is valid (do not trust relays)
+        if not _verify_event(event):  # Ensure the event is valid (do not trust relays)
             raise Exception("Invalid event signature")
         tags = event["tags"]
         if event["kind"] == 13194:  # An info event
@@ -388,7 +341,11 @@ class NWCWallet(Wallet):
                         break
             # if a subscription was found, pass the result to the future
             if subscription:
-                content = self._decrypt_content(event["content"])
+                shared_secret = self.service_pubkey.tweak_mul(
+                    bytes.fromhex(self.account_private_key_hex)
+                ).serialize()[1:]
+
+                content = _decrypt_content(event["content"], shared_secret)
                 content = json.loads(content)
                 result_type = content.get("result_type", "")
                 error = content.get("error", None)
@@ -481,123 +438,6 @@ class NWCWallet(Wallet):
                 logger.debug("Reconnecting to NWC relay in 5 seconds...")
                 await asyncio.sleep(5)
 
-    def _encrypt_content(self, content: str) -> str:
-        """
-        Encrypts the content to be sent to the service.
-
-        Args:
-            content (str): The content to be encrypted.
-
-        Returns:
-            str: The encrypted content.
-        """
-        shared = self.service_pubkey.tweak_mul(
-            bytes.fromhex(self.account_private_key_hex)
-        ).serialize()[1:]
-        # random iv (16B)
-        iv = Random.new().read(AES.block_size)
-        aes = AES.new(shared, AES.MODE_CBC, iv)
-
-        content_bytes = content.encode("utf-8")
-
-        # padding
-        content_bytes = pad(content_bytes, AES.block_size)
-
-        # Encrypt
-        encrypted_b64 = base64.b64encode(aes.encrypt(content_bytes)).decode("ascii")
-        iv_b64 = base64.b64encode(iv).decode("ascii")
-        encrypted_content = encrypted_b64 + "?iv=" + iv_b64
-        return encrypted_content
-
-    def _decrypt_content(self, content: str) -> str:
-        """
-        Decrypts the content coming from the service.
-
-        Args:
-            content (str): The encrypted content.
-
-        Returns:
-            str: The decrypted content.
-        """
-        shared = self.service_pubkey.tweak_mul(
-            bytes.fromhex(self.account_private_key_hex)
-        ).serialize()[1:]
-        # extract iv and content
-        (encrypted_content_b64, iv_b64) = content.split("?iv=")
-        encrypted_content = base64.b64decode(encrypted_content_b64.encode("ascii"))
-        iv = base64.b64decode(iv_b64.encode("ascii"))
-        # Decrypt
-        aes = AES.new(shared, AES.MODE_CBC, iv)
-        decrypted_bytes = aes.decrypt(encrypted_content)
-        decrypted_bytes = unpad(decrypted_bytes, AES.block_size)
-        decrypted = decrypted_bytes.decode("utf-8")
-
-        return decrypted
-
-    def _verify_event(self, event: Dict) -> bool:
-        """
-        Verify the event signature
-
-        Args:
-            event (Dict): The event to verify.
-
-        Returns:
-            bool: True if the event signature is valid, False otherwise.
-        """
-        signature_data = self._json_dumps(
-            [
-                0,
-                event["pubkey"],
-                event["created_at"],
-                event["kind"],
-                event["tags"],
-                event["content"],
-            ]
-        )
-        event_id = hashlib.sha256(signature_data.encode()).hexdigest()
-        if event_id != event["id"]:  # Invalid event id
-            return False
-        pubkey_hex = event["pubkey"]
-        pubkey = secp256k1.PublicKey(bytes.fromhex("02" + pubkey_hex), True)
-        if not pubkey.schnorr_verify(
-            bytes.fromhex(event_id), bytes.fromhex(event["sig"]), None, raw=True
-        ):
-            return False
-        return True
-
-    def _sign_event(self, event: Dict) -> Dict:
-        """
-        Signs the event (in place) with the service secret
-
-        Args:
-            event (Dict): The event to be signed.
-
-        Returns:
-            Dict: The input event with the signature added.
-        """
-        signature_data = self._json_dumps(
-            [
-                0,
-                self.account_public_key_hex,
-                event["created_at"],
-                event["kind"],
-                event["tags"],
-                event["content"],
-            ]
-        )
-
-        event_id = hashlib.sha256(signature_data.encode()).hexdigest()
-        event["id"] = event_id
-        event["pubkey"] = self.account_public_key_hex
-
-        signature = (
-            self.account_private_key.schnorr_sign(
-                bytes.fromhex(event_id), None, raw=True
-            )
-        ).hex()
-        event["sig"] = signature
-        return event
-
     async def _call(self, method: str, params: Dict) -> Dict:
         """
         Call a NWC method.
@@ -612,14 +452,17 @@ class NWCWallet(Wallet):
         await self._wait_for_connection()
         logger.debug("Calling " + method + " with params: " + str(params))
         # Prepare the content
-        content = self._json_dumps(
+        content = _json_dumps(
             {
                 "method": method,
                 "params": params,
             }
         )
         # Encrypt
-        content = self._encrypt_content(content)
+        shared_secret = self.service_pubkey.tweak_mul(
+            bytes.fromhex(self.account_private_key_hex)
+        ).serialize()[1:]
+        content = _encrypt_content(content, shared_secret)
         # Prepare the NWC event
         event = {
             "kind": 23194,
@@ -628,7 +471,7 @@ class NWCWallet(Wallet):
             "tags": [["p", self.service_pubkey_hex]],
         }
         # Sign
-        self._sign_event(event)
+        _sign_event(event, self.account_private_key)
         # Subscribe for a response to this event
         sub_filter = {
             "kinds": [23195],
@@ -879,3 +722,167 @@ class NWCWallet(Wallet):
         while not self._is_shutting_down():
             value = await self.paid_invoices_queue.get()
             yield value
+
+
+def _parse_nwc(nwc) -> Dict:
+    """
+    Parses a NWC URL (nostr+walletconnect://...) and extracts relevant information.
+
+    Args:
+        nwc (str): The Nostr Wallet Connect URL to be parsed.
+
+    Returns:
+        Dict[str, str]: A dict containing:'pubkey', 'relay', and 'secret'.
+        If the URL is invalid, an exception is raised.
+
+    Example:
+        >>> _parse_nwc("nostr+walletconnect://000000...000000?relay=example.com&secret=123")
+        {'pubkey': '000000...000000', 'relay': 'example.com', 'secret': '123'}
+    """
+    data = {}
+    prefix = "nostr+walletconnect://"
+    if nwc and nwc.startswith(prefix):
+        nwc = nwc[len(prefix) :]
+        parsed_url = urlparse(nwc)
+        data["pubkey"] = parsed_url.path
+        query_params = parse_qs(parsed_url.query)
+        for key, value in query_params.items():
+            if key in ["relay", "secret"] and value:
+                data[key] = unquote(value[0])
+        if "pubkey" not in data or "relay" not in data or "secret" not in data:
+            raise ValueError("Invalid NWC pairing url")
+    else:
+        raise ValueError("Invalid NWC pairing url")
+    return data
+
+
+def _json_dumps(data: Union[Dict, list]) -> str:
+    """
+    Converts a Python dictionary to a JSON string with compact encoding.
+
+    Args:
+        data (Dict): The dictionary to be converted.
+
+    Returns:
+        str: The compact JSON string.
+    """
+    if isinstance(data, Dict):
+        data = {k: v for k, v in data.items() if v is not None}
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+def _encrypt_content(content: str, shared_secret: bytes) -> str:
+    """
+    Encrypts the content to be sent to the service.
+
+    Args:
+        content (str): The content to be encrypted.
+
+    Returns:
+        str: The encrypted content.
+    """
+
+    # random iv (16B)
+    iv = Random.new().read(AES.block_size)
+    aes = AES.new(shared_secret, AES.MODE_CBC, iv)
+
+    content_bytes = content.encode("utf-8")
+
+    # padding
+    content_bytes = pad(content_bytes, AES.block_size)
+
+    # Encrypt
+    encrypted_b64 = base64.b64encode(aes.encrypt(content_bytes)).decode("ascii")
+    iv_b64 = base64.b64encode(iv).decode("ascii")
+    encrypted_content = encrypted_b64 + "?iv=" + iv_b64
+    return encrypted_content
+
+
+def _decrypt_content(content: str, shared_secret: bytes) -> str:
+    """
+    Decrypts the content coming from the service.
+
+    Args:
+        content (str): The encrypted content.
+
+    Returns:
+        str: The decrypted content.
+    """
+
+    # extract iv and content
+    (encrypted_content_b64, iv_b64) = content.split("?iv=")
+    encrypted_content = base64.b64decode(encrypted_content_b64.encode("ascii"))
+    iv = base64.b64decode(iv_b64.encode("ascii"))
+    # Decrypt
+    aes = AES.new(shared_secret, AES.MODE_CBC, iv)
+    decrypted_bytes = aes.decrypt(encrypted_content)
+    decrypted_bytes = unpad(decrypted_bytes, AES.block_size)
+    decrypted = decrypted_bytes.decode("utf-8")
+
+    return decrypted
+
+
+def _verify_event(event: Dict) -> bool:
+    """
+    Verify the event signature
+
+    Args:
+        event (Dict): The event to verify.
+
+    Returns:
+        bool: True if the event signature is valid, False otherwise.
+    """
+    signature_data = _json_dumps(
+        [
+            0,
+            event["pubkey"],
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ]
+    )
+    event_id = hashlib.sha256(signature_data.encode()).hexdigest()
+    if event_id != event["id"]:  # Invalid event id
+        return False
+    pubkey_hex = event["pubkey"]
+    pubkey = secp256k1.PublicKey(bytes.fromhex("02" + pubkey_hex), True)
+    if not pubkey.schnorr_verify(
+        bytes.fromhex(event_id), bytes.fromhex(event["sig"]), None, raw=True
+    ):
+        return False
+    return True
+
+
+def _sign_event(event: Dict, account_private_key: secp256k1.PrivateKey) -> Dict:
+    """
+    Signs the event (in place) with the service secret
+
+    Args:
+        event (Dict): The event to be signed.
+
+    Returns:
+        Dict: The input event with the signature added.
+    """
+
+    account_public_key_hex = account_private_key.pubkey.serialize().hex()[2:]
+    signature_data = _json_dumps(
+        [
+            0,
+            account_public_key_hex,
+            event["created_at"],
+            event["kind"],
+            event["tags"],
+            event["content"],
+        ]
+    )
+
+    event_id = hashlib.sha256(signature_data.encode()).hexdigest()
+    event["id"] = event_id
+    event["pubkey"] = account_public_key_hex
+
+    signature = (
+        account_private_key.schnorr_sign(bytes.fromhex(event_id), None, raw=True)
+    ).hex()
+    event["sig"] = signature
+    return event
