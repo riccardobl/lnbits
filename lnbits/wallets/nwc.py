@@ -43,12 +43,6 @@ class NWCWallet(Wallet):
             relay=nwc_data["relay"],
         )
 
-    def _is_shutting_down(self) -> bool:
-        """
-        Returns True if the wallet is shutting down.
-        """
-        return self.conn.shutdown or not settings.lnbits_running
-
     async def cleanup(self):
         logger.debug("Closing NWCWallet connection")
         await self.conn.close()
@@ -72,7 +66,7 @@ class NWCWallet(Wallet):
         else:
             desc = memo or ""
         try:
-            info = await self.conn._get_info()
+            info = await self.conn.get_info()
             if "make_invoice" not in info["supported_methods"]:
                 return InvoiceResponse(
                     False,
@@ -80,7 +74,7 @@ class NWCWallet(Wallet):
                     None,
                     "make_invoice is not supported by this NWC service.",
                 )
-            resp = await self.conn._call(
+            resp = await self.conn.call(
                 "make_invoice",
                 {
                     "amount": int(amount * 1000),  # nwc uses msats denominations
@@ -107,11 +101,11 @@ class NWCWallet(Wallet):
 
     async def status(self) -> StatusResponse:
         try:
-            info = await self.conn._get_info()
+            info = await self.conn.get_info()
             if "get_balance" not in info["supported_methods"]:
                 logger.debug("get_balance is not supported by this NWC service.")
                 return StatusResponse(None, 0)
-            resp = await self.conn._call("get_balance", {})
+            resp = await self.conn.call("get_balance", {})
             balance = int(resp["balance"])
             return StatusResponse(None, balance)
         except Exception as e:
@@ -119,16 +113,16 @@ class NWCWallet(Wallet):
 
     async def pay_invoice(self, bolt11: str, fee_limit_msat: int) -> PaymentResponse:
         try:
-            resp = await self.conn._call("pay_invoice", {"invoice": bolt11})
+            resp = await self.conn.call("pay_invoice", {"invoice": bolt11})
             preimage = resp.get("preimage", None)
             invoice_data = bolt11_decode(bolt11)
             payment_hash = invoice_data.payment_hash
             # pay_invoice doesn't return payment data, so we need
             # to call lookup_invoice too (if supported)
-            info = await self.conn._get_info()
+            info = await self.conn.get_info()
             if "lookup_invoice" in info["supported_methods"]:
                 try:
-                    payment_data = await self.conn._call(
+                    payment_data = await self.conn.call(
                         "lookup_invoice", {"invoice": bolt11}
                     )
                     settled = payment_data.get("settled_at", None) and payment_data.get(
@@ -157,9 +151,9 @@ class NWCWallet(Wallet):
 
     async def get_payment_status(self, checking_id: str) -> PaymentStatus:
         try:
-            info = await self.conn._get_info()
+            info = await self.conn.get_info()
             if "lookup_invoice" in info["supported_methods"]:
-                payment_data = await self.conn._call(
+                payment_data = await self.conn.call(
                     "lookup_invoice", {"payment_hash": checking_id}
                 )
                 settled = payment_data.get("settled_at", None) and payment_data.get(
@@ -186,6 +180,12 @@ class NWCWallet(Wallet):
         while not self._is_shutting_down():
             value = await self.conn.paid_invoices_queue.get()
             yield value
+
+    def _is_shutting_down(self) -> bool:
+        """
+        Returns True if the wallet is shutting down.
+        """
+        return self.conn.shutdown or not settings.lnbits_running
 
 
 class NWConnection:
@@ -258,7 +258,7 @@ class NWConnection:
             + self.service_pubkey_hex
         )
 
-    async def _call(self, method: str, params: Dict) -> Dict:
+    async def call(self, method: str, params: Dict) -> Dict:
         """
         Call a NWC method.
 
@@ -320,6 +320,95 @@ class NWConnection:
         await self._send(["EVENT", event])
         # Wait for the response
         return await future
+
+    async def get_info(self) -> Dict:
+        """
+        Get the info about the service provider and cache it.
+
+        Returns:
+            Dict: The info about the service provider.
+        """
+        if not self.info:  # if not cached
+            try:
+                await self._wait_for_connection()
+                # Prepare filter to request the info note
+                sub_filter = {"kinds": [13194], "authors": [self.service_pubkey_hex]}
+                # We register a special subscription using the sub_id as the event_id
+                sub_id = self._get_new_subid()
+                future = asyncio.get_event_loop().create_future()
+                self.subscriptions[sub_id] = {
+                    "method": "info_sub",
+                    "future": future,
+                    "sub_id": sub_id,
+                    "event_id": sub_id,
+                    "timestamp": time.time(),
+                    "closed": False,
+                }
+                # Send the request
+                await self._send(["REQ", sub_id, sub_filter])
+                # Wait for the response
+                service_info = await future
+                # Get account info when possible
+                if "get_info" in service_info["supported_methods"]:
+                    try:
+                        account_info = await self.call("get_info", {})
+                        # cache
+                        self.info = service_info or {}
+                        self.info["alias"] = account_info.get("alias", "")
+                        self.info["color"] = account_info.get("color", "")
+                        self.info["pubkey"] = account_info.get("pubkey", "")
+                        self.info["network"] = account_info.get("network", "")
+                        self.info["block_height"] = account_info.get("block_height", 0)
+                        self.info["block_hash"] = account_info.get("block_hash", "")
+                        self.info["supported_methods"] = account_info.get(
+                            "methods",
+                            service_info.get("supported_methods", ["pay_invoice"]),
+                        )
+                    except Exception as e:
+                        # If there is an error, fallback to using service info
+                        logger.error(
+                            "Error getting account info: "
+                            + str(e)
+                            + " Using service info only"
+                        )
+                        self.info = service_info
+                else:
+                    # get_info is not supported,
+                    # so we will make do with the service info
+                    self.info = service_info  # cache
+            except Exception as e:
+                logger.error("Error getting info: " + str(e))
+                # The error could mean that the service provider does
+                # not provide an info note
+                # So we just assume it supports the bare minimum to be Nip47 compliant
+                self.info = {
+                    "supported_methods": ["pay_invoice"],
+                }
+        # TODO: fix `or {}`
+        return self.info or {}
+
+    async def close(self):
+        logger.debug("Closing NWConnection")
+        self.shutdown = True  # Mark for shutdown
+        # cancel all tasks
+        try:
+            self.timeout_task.cancel()
+        except Exception as e:
+            logger.warning("Error cancelling subscription timeout task: " + str(e))
+        try:
+            self.connection_task.cancel()
+        except Exception as e:
+            logger.warning("Error cancelling connection task: " + str(e))
+        try:
+            self.pending_payments_lookup_task.cancel()
+        except Exception as e:
+            logger.warning("Error cancelling pending payments lookup task: " + str(e))
+        # close the websocket
+        try:
+            if self.ws:
+                await self.ws.close()
+        except Exception as e:
+            logger.warning("Error closing wallet connection: " + str(e))
 
     async def _send(self, data: List[Union[str, Dict]]):
         """
@@ -478,7 +567,7 @@ class NWConnection:
             for payment in self.pending_payments:
                 try:
                     if not payment["settled"]:
-                        payment_data = await self._call(
+                        payment_data = await self.call(
                             "lookup_invoice", {"payment_hash": payment["checking_id"]}
                         )
                         settled = (
@@ -651,95 +740,6 @@ class NWConnection:
                 # Wait some time before reconnecting
                 logger.debug("Reconnecting to NWC relay in 5 seconds...")
                 await asyncio.sleep(5)
-
-    async def _get_info(self) -> Dict:
-        """
-        Get the info about the service provider and cache it.
-
-        Returns:
-            Dict: The info about the service provider.
-        """
-        if not self.info:  # if not cached
-            try:
-                await self._wait_for_connection()
-                # Prepare filter to request the info note
-                sub_filter = {"kinds": [13194], "authors": [self.service_pubkey_hex]}
-                # We register a special subscription using the sub_id as the event_id
-                sub_id = self._get_new_subid()
-                future = asyncio.get_event_loop().create_future()
-                self.subscriptions[sub_id] = {
-                    "method": "info_sub",
-                    "future": future,
-                    "sub_id": sub_id,
-                    "event_id": sub_id,
-                    "timestamp": time.time(),
-                    "closed": False,
-                }
-                # Send the request
-                await self._send(["REQ", sub_id, sub_filter])
-                # Wait for the response
-                service_info = await future
-                # Get account info when possible
-                if "get_info" in service_info["supported_methods"]:
-                    try:
-                        account_info = await self._call("get_info", {})
-                        # cache
-                        self.info = service_info or {}
-                        self.info["alias"] = account_info.get("alias", "")
-                        self.info["color"] = account_info.get("color", "")
-                        self.info["pubkey"] = account_info.get("pubkey", "")
-                        self.info["network"] = account_info.get("network", "")
-                        self.info["block_height"] = account_info.get("block_height", 0)
-                        self.info["block_hash"] = account_info.get("block_hash", "")
-                        self.info["supported_methods"] = account_info.get(
-                            "methods",
-                            service_info.get("supported_methods", ["pay_invoice"]),
-                        )
-                    except Exception as e:
-                        # If there is an error, fallback to using service info
-                        logger.error(
-                            "Error getting account info: "
-                            + str(e)
-                            + " Using service info only"
-                        )
-                        self.info = service_info
-                else:
-                    # get_info is not supported,
-                    # so we will make do with the service info
-                    self.info = service_info  # cache
-            except Exception as e:
-                logger.error("Error getting info: " + str(e))
-                # The error could mean that the service provider does
-                # not provide an info note
-                # So we just assume it supports the bare minimum to be Nip47 compliant
-                self.info = {
-                    "supported_methods": ["pay_invoice"],
-                }
-        # TODO: fix `or {}`
-        return self.info or {}
-
-    async def close(self):
-        logger.debug("Closing NWConnection")
-        self.shutdown = True  # Mark for shutdown
-        # cancel all tasks
-        try:
-            self.timeout_task.cancel()
-        except Exception as e:
-            logger.warning("Error cancelling subscription timeout task: " + str(e))
-        try:
-            self.connection_task.cancel()
-        except Exception as e:
-            logger.warning("Error cancelling connection task: " + str(e))
-        try:
-            self.pending_payments_lookup_task.cancel()
-        except Exception as e:
-            logger.warning("Error cancelling pending payments lookup task: " + str(e))
-        # close the websocket
-        try:
-            if self.ws:
-                await self.ws.close()
-        except Exception as e:
-            logger.warning("Error closing wallet connection: " + str(e))
 
     def _is_shutting_down(self) -> bool:
         """
