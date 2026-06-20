@@ -61,6 +61,8 @@ class NWCWallet(Wallet):
         self.pending_payments = []
         # interval in seconds between checks for pending payments
         self.pending_payments_lookup_interval = 10
+        # interval in seconds between each lookup for pending payments
+        self.pending_payments_lookup_cooldown = 1
         # track paid invoices for paid_invoices_stream
         self.paid_invoices_queue = asyncio.Queue(0)
         # This task periodically checks if pending payments have been settled
@@ -113,6 +115,7 @@ class NWCWallet(Wallet):
                         payment["expired"] = True
                 except Exception as e:
                     logger.error("Error handling pending payment: " + str(e))
+                await asyncio.sleep(self.pending_payments_lookup_cooldown)
 
             # Remove all settled or expired payments
             self.pending_payments = [
